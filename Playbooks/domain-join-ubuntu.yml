@@ -1,0 +1,150 @@
+---
+# domain-join.yml
+# Joins Ubuntu hosts to grok.local using realmd + sssd.
+# util01 is already joined — this playbook is idempotent and will skip it.
+#
+# Run with:
+#   ansible-playbook -i ~/ansible/inventory.txt ~/ansible/playbooks/domain-join.yml
+#
+# You will be prompted for all required values.
+
+- name: Join Ubuntu hosts to grok.local
+  hosts: ubuntu
+  become: yes
+
+  vars_prompt:
+    - name: domain
+      prompt: "Domain to join (e.g. grok.local)"
+      default: grok.local
+      private: no
+
+    - name: dc_ip
+      prompt: "Domain controller IP"
+      default: 172.16.1.12
+      private: no
+
+    - name: domain_admin
+      prompt: "Domain admin username"
+      default: administrator
+      private: no
+
+    - name: domain_admin_password
+      prompt: "Domain admin password"
+      private: yes
+
+  vars:
+    domain_upper: "{{ domain | upper }}"
+
+  tasks:
+
+    - name: Check if already domain joined
+      command: realm list
+      register: realm_status
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Show current realm status
+      debug:
+        msg: "{{ inventory_hostname }} realm status: {{ realm_status.stdout | default('not joined') }}"
+
+    - name: Install realmd and sssd packages
+      apt:
+        name:
+          - realmd
+          - sssd
+          - sssd-tools
+          - libnss-sss
+          - libpam-sss
+          - adcli
+          - samba-common-bin
+          - oddjob
+          - oddjob-mkhomedir
+          - packagekit
+          - libsss-sudo
+        state: present
+        update_cache: yes
+      when: domain not in realm_status.stdout
+
+    - name: Set DNS to point to domain controller
+      copy:
+        dest: /etc/resolv.conf
+        content: |
+          search {{ domain }}
+          nameserver {{ dc_ip }}
+        mode: '0644'
+      when: domain not in realm_status.stdout
+
+    - name: Verify domain is discoverable
+      command: realm discover {{ domain }}
+      register: realm_discover
+      changed_when: false
+      when: domain not in realm_status.stdout
+
+    - name: Install python3-pexpect for realm join
+      apt:
+        name: python3-pexpect
+        state: present
+      when: domain not in realm_status.stdout
+
+    - name: Join domain
+      expect:
+        command: realm join --user={{ domain_admin }} {{ domain }}
+        responses:
+          Password for *: "{{ domain_admin_password }}"
+        timeout: 60
+      when: domain not in realm_status.stdout
+      register: join_result
+      ignore_errors: yes
+
+    - name: Configure sssd.conf
+      copy:
+        dest: /etc/sssd/sssd.conf
+        content: |
+          [sssd]
+          domains = {{ domain }}
+          config_file_version = 2
+          services = nss, pam, sudo
+
+          [domain/{{ domain }}]
+          default_shell = /bin/bash
+          krb5_store_password_if_offline = True
+          cache_credentials = True
+          krb5_realm = {{ domain_upper }}
+          realmd_tags = manages-system joined-with-adcli
+          id_provider = ad
+          fallback_homedir = /home/%u@%d
+          ad_domain = {{ domain }}
+          use_fully_qualified_names = True
+          ldap_id_mapping = True
+          access_provider = ad
+          sudo_provider = ad
+        mode: '0600'
+        owner: root
+        group: root
+      when: domain not in realm_status.stdout
+      notify: restart sssd
+
+    - name: Enable home directory auto-creation
+      command: pam-auth-update --enable mkhomedir
+      when: domain not in realm_status.stdout
+
+    - name: Ensure sssd is started and enabled
+      service:
+        name: sssd
+        state: started
+        enabled: yes
+
+    - name: Verify domain join
+      command: realm list
+      register: final_status
+      changed_when: false
+
+    - name: Show final join status
+      debug:
+        var: final_status.stdout_lines
+
+  handlers:
+    - name: restart sssd
+      service:
+        name: sssd
+        state: restarted
