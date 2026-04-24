@@ -1,0 +1,21 @@
+- name: Install and enable Cockpit
+# Edit file and add desired host to hosts
+  hosts: util01
+  become: yes
+
+  tasks:
+    - name: Install cockpit package
+      apt:
+        name: cockpit
+        state: present
+        update_cache: yes
+
+    - name: Enable cockpit service
+      systemd:
+        name: cockpit
+        enabled: yes
+
+    - name: Start cockpit service
+      systemd:
+        name: cockpit
+        state: started
